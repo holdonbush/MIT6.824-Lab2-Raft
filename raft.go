@@ -81,6 +81,11 @@ type Raft struct {
 	timer           *time.Ticker  // timer
 	voteTimeout     time.Duration // 选举超时时间，选举超时时间是会变动的，所以定义在Raft结构体中
 	applyChan       chan ApplyMsg // 消息channel
+
+	// 2D
+	lastIncludeIndex  int         // snapshot保存的最后log的index
+	lastIncludeTerm   int         // snapshot保存的最后log的term
+	snapshotCmd       []byte
 }
 
 // LogEntry
@@ -182,7 +187,21 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	// 在lastIncludeIndex后有新的内容，返回false
+	rf.mu.Lock()
+	if len(rf.logs)+rf.lastIncludeIndex > lastIncludedIndex {
+		return false
+	}
 
+	rf.snapshotCmd = snapshot
+	// 当前log最大index小于等于snapshot中存储的最后一个index
+	rf.logs = []LogEntry{}
+	rf.lastIncludeTerm = lastIncludedTerm
+	rf.lastIncludeIndex = lastIncludedIndex
+
+	rf.commitIndex = rf.lastIncludeIndex
+	rf.lastApplied = rf.commitIndex
+	rf.mu.Unlock()
 	return true
 }
 
@@ -192,7 +211,14 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	if rf.killed() {
+		return
+	}
+	pos := index - rf.lastIncludeIndex-1
+	rf.lastIncludeIndex = index
+	rf.lastIncludeTerm = rf.logs[pos].Term
+	rf.logs = rf.logs[pos+1:]
+	rf.snapshotCmd = snapshot
 }
 
 
@@ -255,6 +281,28 @@ type AppendEntriesReply struct {
 	NotMatchIndex  int           // 当前Term的第一个元素（没有被commit的元素）的index
 }
 
+// snapshot
+type InstallSnapshotRequest struct {
+	Term       		 int
+	LeaderId   		 int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	//Offset         int        // Lab2D不要求实现
+	Data         	 []byte
+	//Done         	 bool       // Lab2D不要求实现
+}
+
+type InstallSnapshotErr int64
+const (
+	InstallSnapshotErr_Nil InstallSnapshotErr = iota
+	InstallSnapshotErr_ReqOutofDate
+	InstallSnapshotErr_OldIndex
+)
+type InstallSnapshotResponse struct {
+	Term         int
+	Err          InstallSnapshotErr
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -281,20 +329,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
 	}
+	// 选举限制-参数term小于自身的term
+	candidateLogTermTooOld :=args.LastLogTerm < rf.lastIncludeTerm || (len(rf.logs) > 0 && args.LastLogTerm < rf.logs[len(rf.logs)-1].Term)    // 有log，取最后一条log的term比较 || 无log时参数term小于snapshot的term
+	// 选举限制-term相等，参数index小于自身index
+	candidateLogIndexTooOld :=  (args.LastLogIndex < rf.lastIncludeIndex) || (len(rf.logs) > 0 && args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex < len(rf.logs)+rf.lastIncludeIndex) //有log，取最后一条log的index比较 || 无log时取snapshot的index比较
 
 	// 选举限制
-	if args.LastLogTerm < rf.logs[len(rf.logs)-1].Term {
-		rf.currentTerm = args.Term
-		reply.Term = args.Term
-		reply.VoteGranted = false
-		reply.VoteErr = CandidateLogTooOld
-		rf.persist()
-		rf.mu.Unlock()
-		return
-	}
-
-	if args.LastLogTerm == rf.logs[len(rf.logs)-1].Term &&
-		args.LastLogIndex < len(rf.logs)-1 {
+	if candidateLogIndexTooOld || candidateLogTermTooOld {
 		rf.currentTerm = args.Term
 		reply.Term = args.Term
 		reply.VoteGranted = false
@@ -348,7 +389,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.mu.Lock()
 	// 无效消息
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm || args.PrevLogIndex < rf.lastIncludeIndex {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.AppendErr = AppendErr_ReqOutofDate
@@ -363,7 +404,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.timer.Reset(rf.voteTimeout)
 
 	// 不匹配
-	if args.PrevLogIndex >= len(rf.logs) || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
+	if (args.PrevLogIndex != rf.lastIncludeIndex && (args.PrevLogIndex >= len(rf.logs)+rf.lastIncludeIndex+1 || args.PrevLogTerm != rf.logs[args.PrevLogIndex-rf.lastIncludeIndex-1].Term)) ||
+		(args.PrevLogIndex == rf.lastIncludeIndex && args.PrevLogTerm != rf.lastIncludeTerm){
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.AppendErr = AppendErr_LogsNotMatch
@@ -385,7 +427,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 处理日志
 	if args.Logs != nil {
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = rf.logs[:args.PrevLogIndex-rf.lastIncludeIndex]
 		rf.logs = append(rf.logs, args.Logs...)
 	}
 	for rf.lastApplied < args.LeaderCommit {
@@ -393,7 +435,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.lastApplied,
-			Command: rf.logs[rf.lastApplied].Cmd,
+			Command: rf.logs[rf.lastApplied-rf.lastIncludeIndex-1].Cmd,
 		}
 		rf.applyChan <- applyMsg
 		rf.commitIndex = rf.lastApplied
@@ -405,6 +447,66 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.AppendErr = AppendErr_Nil
 	reply.NotMatchIndex = -1
 	rf.persist()
+	rf.mu.Unlock()
+	return
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotResponse) {
+	if rf.killed() {
+		reply.Term = args.Term
+		return
+	}
+
+	rf.mu.Lock()
+	//fmt.Println(rf.me,"收到snapshot","来自",args.LeaderId,"自身lastinclueindex",rf.lastIncludeTerm, args.LastIncludeIndex)
+	// defer rf.mu.Unlock()
+
+	// 过期消息
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		//fmt.Println("installsnapshot消息过期")
+		reply.Err = InstallSnapshotErr_ReqOutofDate
+		rf.mu.Unlock()
+		return
+	}
+
+	// 错误消息
+	if args.LastIncludeIndex <= rf.lastIncludeIndex {
+		reply.Term = rf.currentTerm
+		//fmt.Println("installsnapsho消息lastIncludeIndex错误")
+		reply.Err = InstallSnapshotErr_OldIndex
+		rf.timer.Reset(rf.voteTimeout)
+		rf.mu.Unlock()
+		return
+	}
+	// 创建快照
+	rf.currentTerm = args.Term
+	rf.voteFor = args.LeaderId
+	rf.myStatus = Follower
+	rf.timer.Reset(rf.voteTimeout)
+
+	if len(rf.logs)+rf.lastIncludeIndex <= args.LastIncludeIndex {
+		rf.logs = []LogEntry{}
+		rf.lastIncludeIndex = args.LastIncludeIndex
+		rf.lastIncludeTerm = args.LastIncludeTerm
+	} else {
+		//  rf.logs = rf.logs[len(rf.logs)+rf.lastIncludeIndex-args.LastIncludeIndex:]
+		rf.logs = rf.logs[args.LastIncludeIndex-rf.lastIncludeIndex:]
+		rf.lastIncludeIndex = args.LastIncludeIndex
+		rf.lastIncludeTerm = args.LastIncludeTerm
+	}
+
+	rf.applyChan <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludeTerm,
+		SnapshotIndex: args.LastIncludeIndex,
+	}
+	rf.lastApplied = args.LastIncludeIndex
+	rf.commitIndex = rf.lastApplied
+
+	reply.Term = rf.currentTerm
+	reply.Err = InstallSnapshotErr_Nil
 	rf.mu.Unlock()
 	return
 }
@@ -501,7 +603,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.myStatus = Leader
 			rf.nextIndexs = make([]int, len(rf.peers))
 			for i,_ := range rf.nextIndexs {
-				rf.nextIndexs[i] = len(rf.logs)
+				rf.nextIndexs[i] = len(rf.logs)+rf.lastIncludeIndex+1
 			}
 			rf.timer.Reset(HeartBeatTimeout)
 		}
@@ -535,22 +637,21 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.mu.Unlock()
 		return false
 	}
-	rf.mu.Unlock()
 
 	switch reply.AppendErr {
 	case AppendErr_Nil:
-		rf.mu.Lock()
 		if reply.Success && reply.Term == rf.currentTerm && *appendNum <= len(rf.peers)/2 {
 			*appendNum++
 		}
-		if rf.nextIndexs[server] >= args.LogIndex+1 {
+		if rf.nextIndexs[server] > args.LogIndex+1 {
 			rf.mu.Unlock()
 			return ok
 		}
 		rf.nextIndexs[server] = args.LogIndex+1
 		if *appendNum > len(rf.peers)/2 {
 			*appendNum = 0
-			if rf.logs[args.LogIndex].Term != rf.currentTerm {
+			if (args.LogIndex>rf.lastIncludeIndex && rf.logs[args.LogIndex-rf.lastIncludeIndex-1].Term != rf.currentTerm) ||
+				(args.LogIndex == rf.lastIncludeIndex && rf.lastIncludeTerm != rf.currentTerm){
 				rf.mu.Unlock()
 				return false
 			}
@@ -558,16 +659,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				rf.lastApplied++
 				applyMsg := ApplyMsg{
 					CommandValid:  true,
-					Command:       rf.logs[rf.lastApplied].Cmd,
+					Command:       rf.logs[rf.lastApplied-rf.lastIncludeIndex-1].Cmd,
 					CommandIndex:  rf.lastApplied,
 				}
 				rf.applyChan <- applyMsg
 				rf.commitIndex = rf.lastApplied
 			}
 		}
-		rf.mu.Unlock()
 	case AppendErr_ReqOutofDate:
-		rf.mu.Lock()
 		rf.myStatus = Follower
 		rf.timer.Reset(rf.voteTimeout)
 		if reply.Term > rf.currentTerm {
@@ -575,17 +674,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.voteFor = -1
 			rf.persist()
 		}
-		rf.mu.Unlock()
 	case AppendErr_LogsNotMatch:
-		rf.mu.Lock()
 		if args.Term != rf.currentTerm {
 			rf.mu.Unlock()
 			return false
 		}
 		rf.nextIndexs[server] = reply.NotMatchIndex
-		rf.mu.Unlock()
 	case AppendErr_ReqRepeat:
-		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.myStatus = Follower
 			rf.currentTerm = reply.Term
@@ -593,19 +688,68 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.timer.Reset(rf.voteTimeout)
 			rf.persist()
 		}
-		rf.mu.Unlock()
 	case AppendErr_Commited:
-		rf.mu.Lock()
 		if args.Term != rf.currentTerm {
 			rf.mu.Unlock()
 			return false
 		}
 		rf.nextIndexs[server] = reply.NotMatchIndex
-		rf.mu.Unlock()
 	case AppendErr_RaftKilled:
+		rf.mu.Unlock()
 		return false
 	}
+	rf.mu.Unlock()
 	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotResponse) bool {
+	if rf.killed() {
+		return false
+	}
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	for !ok {
+		if rf.killed() {
+			return false
+		}
+		ok = rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+		if ok {
+			break
+		}
+	}
+
+	if rf.killed() {
+		return false
+	}
+	rf.mu.Lock()
+	if reply.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return false
+	}
+	switch reply.Err {
+	case InstallSnapshotErr_Nil:
+		if reply.Term > rf.currentTerm {
+			rf.myStatus = Follower
+			rf.currentTerm = reply.Term
+			rf.voteFor = -1
+			rf.timer.Reset(rf.voteTimeout)
+			rf.persist()
+		}
+		rf.nextIndexs[server] = args.LastIncludeIndex+1
+	case InstallSnapshotErr_OldIndex:
+		if reply.Term > rf.currentTerm {
+			rf.myStatus = Follower
+			rf.currentTerm = reply.Term
+			rf.voteFor = -1
+			rf.timer.Reset(rf.voteTimeout)
+			rf.persist()
+		}
+		rf.nextIndexs[server] = len(rf.logs)+rf.lastIncludeIndex+1
+	case InstallSnapshotErr_ReqOutofDate:
+	}
+
+
+	rf.mu.Unlock()
+	return false
 }
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -640,7 +784,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	logEntry := LogEntry{Term: rf.currentTerm, Cmd:  command}
 	rf.logs = append(rf.logs, logEntry)
 
-	index = len(rf.logs)-1
+	index = len(rf.logs)+rf.lastIncludeIndex
 	term = rf.currentTerm
 	rf.persist()
 	rf.mu.Unlock()
@@ -708,10 +852,14 @@ func (rf *Raft) ticker() {
 					voteArgs := &RequestVoteArgs{
 						Term:         rf.currentTerm,
 						Candidate:    rf.me,
-						LastLogIndex: len(rf.logs)-1,
-						LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+						LastLogIndex: len(rf.logs)+rf.lastIncludeIndex,
+						LastLogTerm:  rf.lastIncludeTerm,
+					}
+					if len(rf.logs) > 0 {
+						voteArgs.LastLogTerm = rf.logs[len(rf.logs)-1].Term
 					}
 					voteReply := new(RequestVoteReply)
+					//fmt.Println("发起选举",rf.me,i,voteArgs,rf.currentTerm, rf.lastIncludeIndex, rf.lastIncludeTerm)
 					go rf.sendRequestVote(i, voteArgs, voteReply, &voteNum)
 				}
 			case Leader:
@@ -730,22 +878,40 @@ func (rf *Raft) ticker() {
 						PrevLogTerm:  0,
 						Logs:         nil,
 						LeaderCommit: rf.commitIndex,
-						LogIndex:     len(rf.logs)-1,
+						LogIndex:     len(rf.logs)+rf.lastIncludeIndex,
 					}
-					for rf.nextIndexs[i] > 0 {
+					//installSnapshot，如果rf.nextIndex[i]小于等lastCludeIndex,则发送snapShot
+					if rf.nextIndexs[i] <= rf.lastIncludeIndex {
+						installSnapshotReq := &InstallSnapshotRequest{
+							Term:             rf.currentTerm,
+							LeaderId:         rf.me,
+							LastIncludeIndex: rf.lastIncludeIndex,
+							LastIncludeTerm:  rf.lastIncludeTerm,
+							Data:             rf.snapshotCmd,
+						}
+						installSnapshotReply := &InstallSnapshotResponse{}
+						//fmt.Println("installsnapshot", rf.me, i, rf.lastIncludeIndex, rf.lastIncludeTerm, rf.currentTerm, installSnapshotReq)
+						go rf.sendInstallSnapshot(i, installSnapshotReq, installSnapshotReply)
+						continue
+					}
+					for rf.nextIndexs[i] > rf.lastIncludeIndex {
 						appendEntriesArgs.PrevLogIndex = rf.nextIndexs[i]-1
-						if appendEntriesArgs.PrevLogIndex >= len(rf.logs) {
+						if appendEntriesArgs.PrevLogIndex >= len(rf.logs)+rf.lastIncludeIndex+1 {
 							rf.nextIndexs[i]--
 							continue
 						}
-						appendEntriesArgs.PrevLogTerm = rf.logs[appendEntriesArgs.PrevLogIndex].Term
+						if appendEntriesArgs.PrevLogIndex == rf.lastIncludeIndex {
+							appendEntriesArgs.PrevLogTerm = rf.lastIncludeTerm
+						} else {
+							appendEntriesArgs.PrevLogTerm = rf.logs[appendEntriesArgs.PrevLogIndex-rf.lastIncludeIndex-1].Term
+						}
 						break
 					}
-					if rf.nextIndexs[i] < len(rf.logs) {
-						// appendEntriesArgs.Logs = rf.logs[rf.nextIndexs[i]:appendEntriesArgs.LogIndex+1]
-						appendEntriesArgs.Logs = make([]LogEntry, appendEntriesArgs.LogIndex+1-rf.nextIndexs[i])
-						copy(appendEntriesArgs.Logs, rf.logs[rf.nextIndexs[i]:appendEntriesArgs.LogIndex+1])
+					if rf.nextIndexs[i] < len(rf.logs)+rf.lastIncludeIndex+1 {
+						appendEntriesArgs.Logs = make([]LogEntry,appendEntriesArgs.LogIndex+1-rf.nextIndexs[i])
+						copy(appendEntriesArgs.Logs, rf.logs[rf.nextIndexs[i]-rf.lastIncludeIndex-1:appendEntriesArgs.LogIndex-rf.lastIncludeIndex])
 					}
+
 					appendEntriesReply := new(AppendEntriesReply)
 					go rf.sendAppendEntries(i, appendEntriesArgs, appendEntriesReply, &appendNum)
 				}
@@ -782,6 +948,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndexs, rf.matchIndexs, rf.logs = nil, nil, []LogEntry{{0,nil}}
 	rf.timer = time.NewTicker(rf.voteTimeout)
 	rf.applyChan = applyCh
+
+	// 2D
+	rf.lastIncludeIndex = -1
+	rf.lastIncludeTerm = 0
+	rf.snapshotCmd = make([]byte, 0)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

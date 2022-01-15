@@ -9,3 +9,6 @@ implement of Lab2-Raft of MIT6.824
 
 ## Lab2C
 执行命令`go test -run 2C -race`
+
+## Lab2D
+执行命令`go test -run 2D`

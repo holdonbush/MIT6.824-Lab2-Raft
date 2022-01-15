@@ -182,6 +182,7 @@ const (
 	VoteReqOutofDate        //投票消息过期
 	CandidateLogTooOld      //候选人Log不够新
 	VotedThisTerm           //本Term内已经投过票
+	RaftKilled              //Raft程已终止
 )
 
 type RequestVoteArgs struct {
@@ -208,6 +209,9 @@ const (
 	AppendErr_Nil AppendEntriesErr = iota    // Append操作无错误
 	AppendErr_LogsNotMatch                   // Append操作log不匹配
 	AppendErr_ReqOutofDate                   // Append操作请求过期
+	AppendErr_ReqRepeat                      // Append请求重复
+	AppendErr_Commited                       // Append的log已经commit
+	AppendErr_RaftKilled                     // Raft程序终止
  )
 
 type AppendEntriesArgs struct {
@@ -232,6 +236,12 @@ type AppendEntriesReply struct {
 // 投票过程
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if rf.killed() {
+		reply.Term = -1
+		reply.VoteGranted = false
+		reply.VoteErr = RaftKilled
+		return
+	}
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm {      // 请求term更小，不投票
 		reply.Term = rf.currentTerm
@@ -241,7 +251,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// TODO - 选举限制,在LabA中不涉及
+	if args.Term > rf.currentTerm {
+		rf.myStatus = Follower
+		rf.currentTerm = args.Term
+		rf.voteFor = -1
+	}
+
+	// 选举限制
+	if args.LastLogTerm < rf.logs[len(rf.logs)-1].Term {
+		rf.currentTerm = args.Term
+		reply.Term = args.Term
+		reply.VoteGranted = false
+		reply.VoteErr = CandidateLogTooOld
+		rf.mu.Unlock()
+		return
+	}
+
+	if args.LastLogTerm == rf.logs[len(rf.logs)-1].Term &&
+		args.LastLogIndex < len(rf.logs)-1 {
+		rf.currentTerm = args.Term
+		reply.Term = args.Term
+		reply.VoteGranted = false
+		reply.VoteErr = CandidateLogTooOld
+		rf.mu.Unlock()
+		return
+	}
 
 	if args.Term == rf.currentTerm {
 		reply.Term = args.Term
@@ -277,6 +311,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 // 心跳包/log追加
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
+	if rf.killed() {
+		reply.Term = -1
+		reply.AppendErr = AppendErr_RaftKilled
+		reply.Success = false
+		return
+	}
 	rf.mu.Lock()
 	// 无效消息
 	if args.Term < rf.currentTerm {
@@ -292,9 +332,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.myStatus = Follower
 	rf.timer.Reset(rf.voteTimeout)
 
-	// todo - 不匹配，Lab2A可以先不实现
+	// 不匹配
+	if args.PrevLogIndex >= len(rf.logs) || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.AppendErr = AppendErr_LogsNotMatch
+		rf.mu.Unlock()
+		return
+	}
 
-	// todo - 处理日志,Lab2A可以先不实现
+	if rf.lastApplied > args.PrevLogIndex {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.AppendErr = AppendErr_Commited
+		rf.mu.Unlock()
+		return
+	}
+
+	// 处理日志
+	if args.Logs != nil {
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Logs...)
+	}
+	for rf.lastApplied < args.LeaderCommit {
+		rf.lastApplied++
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			CommandIndex: rf.lastApplied,
+			Command: rf.logs[rf.lastApplied].Cmd,
+		}
+		rf.applyChan <- applyMsg
+		rf.commitIndex = rf.lastApplied
+	}
 
 
 	reply.Term = rf.currentTerm
@@ -333,15 +402,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 //
 // 改造函数，添加了一个参数，用于方便实现同一Term内请求的统计
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteNum *int) bool {
+	if rf.killed() {
+		return false
+	}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	for !ok {
 		// 失败重传
+		if rf.killed() {
+			return false
+		}
 		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 		if ok {
 			break
 		}
 	}
 
+	if rf.killed() {
+		return false
+	}
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm {   // 过期请求
 		rf.mu.Unlock()
@@ -389,19 +467,30 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.timer.Reset(HeartBeatTimeout)
 		}
 		rf.mu.Unlock()
+	case RaftKilled:
+		return false
 	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, appendNum *int) bool {
+	if rf.killed() {
+		return false
+	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	for !ok {
+		if rf.killed() {
+			return false
+		}
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		if ok {
 			break
 		}
 	}
 
+	if rf.killed() {
+		return false
+	}
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm { // 过期消息
 		rf.mu.Unlock()
@@ -415,6 +504,28 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		if reply.Success && reply.Term == rf.currentTerm && *appendNum <= len(rf.peers)/2 {
 			*appendNum++
 		}
+		if rf.nextIndexs[server] >= args.LogIndex+1 {
+			rf.mu.Unlock()
+			return ok
+		}
+		rf.nextIndexs[server] = args.LogIndex+1
+		if *appendNum > len(rf.peers)/2 {
+			*appendNum = 0
+			if rf.logs[args.LogIndex].Term != rf.currentTerm {
+				rf.mu.Unlock()
+				return false
+			}
+			for rf.lastApplied < args.LogIndex {
+				rf.lastApplied++
+				applyMsg := ApplyMsg{
+					CommandValid:  true,
+					Command:       rf.logs[rf.lastApplied].Cmd,
+					CommandIndex:  rf.lastApplied,
+				}
+				rf.applyChan <- applyMsg
+				rf.commitIndex = rf.lastApplied
+			}
+		}
 		rf.mu.Unlock()
 	case AppendErr_ReqOutofDate:
 		rf.mu.Lock()
@@ -426,7 +537,90 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 		rf.mu.Unlock()
 	case AppendErr_LogsNotMatch:
-		// todo
+		rf.mu.Lock()
+		if args.Term != rf.currentTerm {
+			rf.mu.Unlock()
+			return false
+		}
+		rf.nextIndexs[server]--
+		argsNewa := &AppendEntriesArgs{
+			Term:         args.Term,
+			LeaderId:     rf.me,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Logs:         nil,
+			LeaderCommit: args.LeaderCommit,
+			//ReqIndex:     args.ReqIndex,
+			LogIndex:     args.LogIndex,
+		}
+		for rf.nextIndexs[server] > 0 {
+			argsNewa.PrevLogIndex = rf.nextIndexs[server]-1
+			if argsNewa.PrevLogIndex >= len(rf.logs) {
+				rf.nextIndexs[server]--
+				continue
+			}
+			argsNewa.PrevLogTerm = rf.logs[argsNewa.PrevLogIndex].Term
+			break
+		}
+		if rf.nextIndexs[server] < args.LogIndex+1 {
+			argsNewa.Logs = rf.logs[rf.nextIndexs[server]:args.LogIndex+1]
+		}
+		reply := new(AppendEntriesReply)
+		go rf.sendAppendEntries(server, argsNewa, reply,appendNum)
+		rf.mu.Unlock()
+	case AppendErr_ReqRepeat:
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.myStatus = Follower
+			rf.currentTerm = reply.Term
+			rf.voteFor = -1
+			rf.timer.Reset(rf.voteTimeout)
+		}
+		rf.mu.Unlock()
+	case AppendErr_Commited:
+		rf.mu.Lock()
+		if args.Term != rf.currentTerm {
+			rf.mu.Unlock()
+			return false
+		}
+		rf.nextIndexs[server]++
+		if reply.Term > rf.currentTerm {
+			rf.myStatus = Follower
+			rf.currentTerm = reply.Term
+			rf.voteFor = -1
+			rf.timer.Reset(rf.voteTimeout)
+			rf.mu.Unlock()
+			return false
+		}
+
+		argsNewa := &AppendEntriesArgs{
+			Term:         args.Term,
+			LeaderId:     rf.me,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Logs:         nil,
+			LeaderCommit: args.LeaderCommit,
+			//ReqIndex:     args.ReqIndex,
+			LogIndex:     args.LogIndex,
+		}
+		for rf.nextIndexs[server] > 0 {
+			argsNewa.PrevLogIndex = rf.nextIndexs[server]-1
+			if argsNewa.PrevLogIndex >= len(rf.logs) {
+				rf.nextIndexs[server]--
+				continue
+			}
+			argsNewa.PrevLogTerm = rf.logs[argsNewa.PrevLogIndex].Term
+			break
+		}
+		if rf.nextIndexs[server] < args.LogIndex+1 {
+			argsNewa.Logs = rf.logs[rf.nextIndexs[server]:args.LogIndex+1]
+		}
+		reply := new(AppendEntriesReply)
+		go rf.sendAppendEntries(server, argsNewa, reply,appendNum)
+
+		rf.mu.Unlock()
+	case AppendErr_RaftKilled:
+		return false
 	}
 	return ok
 }
@@ -450,7 +644,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	// 客户端的log
+	if rf.killed() {
+		return index, term, false
+	}
+	rf.mu.Lock()
+	isLeader = rf.myStatus == Leader
+	if !isLeader {
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
+	logEntry := LogEntry{Term: rf.currentTerm, Cmd:  command}
+	rf.logs = append(rf.logs, logEntry)
 
+	index = len(rf.logs)-1
+	term = rf.currentTerm
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -469,6 +678,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.timer.Stop()
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -486,6 +698,9 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		select {
 		case <-rf.timer.C:
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			currStatus := rf.myStatus
 			switch currStatus {
@@ -531,6 +746,18 @@ func (rf *Raft) ticker() {
 						Logs:         nil,
 						LeaderCommit: rf.commitIndex,
 						LogIndex:     len(rf.logs)-1,
+					}
+					for rf.nextIndexs[i] > 0 {
+						appendEntriesArgs.PrevLogIndex = rf.nextIndexs[i]-1
+						if appendEntriesArgs.PrevLogIndex >= len(rf.logs) {
+							rf.nextIndexs[i]--
+							continue
+						}
+						appendEntriesArgs.PrevLogTerm = rf.logs[appendEntriesArgs.PrevLogIndex].Term
+						break
+					}
+					if rf.nextIndexs[i] < len(rf.logs) {
+						appendEntriesArgs.Logs = rf.logs[rf.nextIndexs[i]:appendEntriesArgs.LogIndex+1]
 					}
 					appendEntriesReply := new(AppendEntriesReply)
 					go rf.sendAppendEntries(i, appendEntriesArgs, appendEntriesReply, &appendNum)
